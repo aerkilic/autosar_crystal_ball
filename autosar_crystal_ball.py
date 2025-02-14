@@ -2,103 +2,91 @@ from transformers import BertTokenizer, BertForSequenceClassification, Trainer, 
 import torch
 import json
 import re
+import os
 from datasets import Dataset
-
-# Spezialtokens definieren
-SPECIAL_TOKENS = {
-    "additional_special_tokens": [
-        "[SD]", "[SDCONFIG]", "[LOWERMULTIPLICITY]", "[UPPERMULTIPLICITY]", "[SDSERVERTIMER]", "[SDCLIENTTIMER]", "[SDEVENTHANDLER]", "[SDCONSUMEDEVENTGROUP]", "[SDSERVICEINSTANCE]", "[SDOFFER]", "[SDSUBSCRIBE]", "[SDTXPDUREF]", "[SDRXPDUREF]", "[SERVICEINSTANCEID]", "[SERVICEINTERFACE]", "[SERVICEVERSION]", "[TRANSPORTPROTOCOL]", "[IPCONFIGURATION]", "[DISCOVERYMODE]", "[MANDATORY]"
-    ]
-}
 
 # JSON-Beispieldaten für AUTOSAR SD mit mehreren Beispielen
 json_data = '''{
-  "Sd": {
-    "SdConfig": {
-      "LowerMultiplicity": 1,
-      "UpperMultiplicity": "n",
-      "SdServiceInstance": [
-        {
-          "ServiceInstanceID": "Service_1",
-          "ServiceInterface": "SomeServiceInterface",
-          "ServiceVersion": "1.0.0",
-          "TransportProtocol": "SOME/IP",
-          "IPConfiguration": {
-            "IPAddress": "192.168.1.100",
-            "Port": 30509
-          },
-          "DiscoveryMode": "DynamicDiscovery",
-          "Mandatory": true
-        },
-        {
-          "ServiceInstanceID": "Service_2",
-          "ServiceInterface": "AnotherServiceInterface",
-          "ServiceVersion": "2.1.0",
-          "TransportProtocol": "SOME/IP",
-          "IPConfiguration": {
-            "IPAddress": "192.168.1.101",
-            "Port": 30510
-          },
-          "DiscoveryMode": "OneTime",
-          "Mandatory": false
-        },
-        {
-          "ServiceInstanceID": "Service_3",
-          "ServiceInterface": "UnknownService",
-          "ServiceVersion": "3.0.5",
-          "TransportProtocol": "MQTT",
-          "IPConfiguration": {
-            "IPAddress": "10.0.0.50",
-            "Port": 1883
-          },
-          "DiscoveryMode": "PeriodicDiscovery",
-          "Mandatory": true
-        },
-        {
-          "ServiceInstanceID": "Service_4",
-          "ServiceInterface": "ExperimentalService",
-          "ServiceVersion": "0.9.1",
-          "TransportProtocol": "HTTP",
-          "IPConfiguration": {
-            "IPAddress": "192.168.2.200",
-            "Port": 8080
-          },
-          "DiscoveryMode": "ExperimentalMode",
-          "Mandatory": false
-        }
-      ]
+    "SdGeneral": {
+      "SdDevErrorDetect": {
+        "value": "true",
+        "mandatory": "true"
+      },
+      "mandatory": "true"
     }
-  }
 }'''
+
+
+
 
 # JSON laden
 data = json.loads(json_data)
 
+# **Alle Schlüsselwörter extrahieren und als Spezialtokens definieren**
+def extract_keys(obj, tokens=None):
+    if tokens is None:
+        tokens = set()  # Set nur einmal initialisieren
+
+    if isinstance(obj, dict):  # Falls obj ein Dictionary ist, durchlaufe seine Schlüssel
+        for key, value in obj.items():
+            tokens.add(f"[{key.upper()}]")  # Schlüssel in Spezialtoken umwandeln
+            extract_keys(value, tokens)  # Rekursiver Aufruf für die Werte
+
+    elif isinstance(obj, list):  # Falls obj eine Liste ist, durchlaufe die Elemente
+        for item in obj:
+            extract_keys(item, tokens)  # Rekursiver Aufruf für jedes Listenelement
+
+    return tokens  # Das vollständige Token-Set zurückgeben
+
+
+# Spezialtokens extrahieren und in ein Dictionary packen
+special_tokens = {"additional_special_tokens": list(extract_keys(data))}
+
 # BERT Tokenizer laden und Spezialtokens hinzufügen
 tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
-tokenizer.add_special_tokens(SPECIAL_TOKENS)
+tokenizer.add_special_tokens(special_tokens)
 model = BertForSequenceClassification.from_pretrained("bert-base-uncased", num_labels=2)
 model.resize_token_embeddings(len(tokenizer))
 
-# Funktion zum Umwandeln von JSON-Schlüsseln in Spezialtokens
-def convert_json_to_special_tokens(data):
-    text = ""
-    if "LowerMultiplicity" in data:
-        text += f"[LOWERMULTIPLICITY] {data['LowerMultiplicity']} "
-    if "UpperMultiplicity" in data:
-        text += f"[UPPERMULTIPLICITY] {data['UpperMultiplicity']} "
-    return text.strip()
+# **Funktion zur Konvertierung des JSON in Spezialtoken-Text**
+def convert_json_to_special_tokens(obj):
+    if isinstance(obj, dict):
+        text = " ".join([f"[{key.upper()}] {convert_json_to_special_tokens(value)}" for key, value in obj.items()])
+    elif isinstance(obj, list):
+        text = " ".join([convert_json_to_special_tokens(item) for item in obj])
+    else:
+        text = str(obj)
+    return text
 
-# Dataset vorbereiten
+# **Dataset vorbereiten – jetzt mit echten Labels!**
+# **Dataset vorbereiten – rekursiv für alle Parameter mit "mandatory"**
 def prepare_dataset(data):
     samples = []
-    for instance in data["Sd"]["SdConfig"]["SdServiceInstance"]:
-        mandatory_token = "[MANDATORY]" if instance["Mandatory"] else "[OPTIONAL]"
-        instance_tokens = " ".join([f"[{key.upper()}] {value}" for key, value in instance.items() if key != "Mandatory"])
-        service_info = convert_json_to_special_tokens(data["Sd"]["SdConfig"])
-        text = f"{mandatory_token} {instance_tokens} {service_info}"
-        label = 1 if instance["Mandatory"] else 0
-        samples.append({"text": text, "label": label})
+
+    def traverse(obj, parent_key=""):
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                new_key = f"{parent_key}.{key}" if parent_key else key  # Hierarchie beibehalten
+                
+                if isinstance(value, dict):
+                    traverse(value, new_key)  # Rekursiv weitermachen
+                    
+                    # Falls dieses Dict ein "mandatory"-Attribut besitzt, als Sample hinzufügen
+                 #   if "mandatory" in value:
+                 #       text = f"[{new_key.upper()}] {convert_json_to_special_tokens(value)}"
+                 #       label = 1 if value["mandatory"] == "true" else 0
+                 #       samples.append({"text": text, "label": label})
+                
+                elif isinstance(value, list):
+                    for item in value:
+                        traverse(item, new_key)  # Falls es eine Liste ist, jeden Eintrag prüfen
+
+                elif isinstance(value, str):
+                  if "mandatory" in key:
+                    text = f"[{new_key.upper()}] {convert_json_to_special_tokens(value)}"
+                    label = 1 if value == "true" else 0
+                    samples.append({"text": text, "label": label})
+    traverse(data)
     return samples
 
 dataset = Dataset.from_list(prepare_dataset(data))
@@ -133,36 +121,59 @@ model = BertForSequenceClassification.from_pretrained("./trained_model").to(devi
 tokenizer = BertTokenizer.from_pretrained("./trained_model")
 model.eval()
 
-# --- Vorhersage (Prediction) ---
+# **Vorhersage-Funktion**
+def predict(json_text):
+    instance = json.loads(json_text)  # JSON laden
 
-def predict(text):
-    instance = json.loads(text)
-    mandatory_token = "[MANDATORY]" if instance["Mandatory"] else "[OPTIONAL]"
-    instance_tokens = " ".join([f"[{key.upper()}] {value}" for key, value in instance.items() if key != "Mandatory"])
-    service_info = convert_json_to_special_tokens(data["Sd"]["SdConfig"])
-    text = f"{mandatory_token} {instance_tokens} {service_info}"
-    inputs = tokenizer(text, return_tensors="pt", padding="max_length", truncation=True)
-    inputs = {k: v.to(device) for k, v in inputs.items()}
-    with torch.no_grad():
-        outputs = model(**inputs)
-    predicted_class = torch.argmax(outputs.logits, dim=-1).item()
-    return "Mandatory" if predicted_class == 1 else "Optional"
+    predictions = {}  # Dictionary zur Speicherung der Vorhersagen
 
-# Testfälle mit vorhergesehenen und unvorhergesehenen Daten
-for instance in data["Sd"]["SdConfig"]["SdServiceInstance"]:
-    print(f"Prediction for {instance['ServiceInstanceID']}:", predict(json.dumps(instance)))
+    def traverse_and_predict(obj, parent_key=""):
+        # 1) Wenn 'obj' ein Dictionary ist
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                new_key = f"{parent_key}.{key}" if parent_key else key
 
-# Unvorhergesehenes Beispiel testen
-unexpected_service = {
-    "ServiceInstanceID": "Service_Unknown",
-    "ServiceInterface": "NewExperimentalInterface",
-    "ServiceVersion": "5.2.0",
-    "TransportProtocol": "WebSockets",
-    "IPConfiguration": {
-        "IPAddress": "10.1.1.50",
-        "Port": 9090
-    },
-    "DiscoveryMode": "UnknownMode",
-    "Mandatory": False
-}
-print("Prediction for unexpected service:", predict(json.dumps(unexpected_service)))
+                # 2) Wenn 'value' selbst ein Dictionary oder eine Liste ist, weiter rekursiv
+                if isinstance(value, dict):
+                    traverse_and_predict(value, new_key)
+                elif isinstance(value, list):
+                    for item in value:
+                        traverse_and_predict(item, new_key)
+
+                # 3) Wenn 'value' ein String ist UND key == "mandatory" -> klassifizieren
+                elif isinstance(value, str) and key == "mandatory":
+                    # Spezial-Token-Text aufbereiten
+                    text_for_inference = f"[{new_key.upper()}] {convert_json_to_special_tokens(value)}"
+                    
+                    inputs = tokenizer(
+                        text_for_inference,
+                        return_tensors="pt",
+                        padding="max_length",
+                        truncation=True
+                    )
+                    # Auf GPU verschieben (falls vorhanden)
+                    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+                    # Kein Gradienten-Tracking für Inferenz
+                    with torch.no_grad():
+                        outputs = model(**inputs)
+
+                    predicted_class = torch.argmax(outputs.logits, dim=-1).item()
+                    # Klassenergebnis ins Dictionary eintragen
+                    predictions[new_key] = "Mandatory" if predicted_class == 1 else "Optional"
+
+        # 4) Wenn 'obj' eine Liste ist, rekursiv durchlaufen
+        elif isinstance(obj, list):
+            for item in obj:
+                traverse_and_predict(item, parent_key)
+
+    # Rekursiven Durchlauf starten
+    traverse_and_predict(instance)
+
+    return predictions
+
+
+
+
+#print("Prediction for unexpected service:", predict(json.dumps(unexpected_service)))
+print("Prediction for unexpected service:", predict(json_data))
